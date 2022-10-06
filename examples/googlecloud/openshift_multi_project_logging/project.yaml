@@ -1,0 +1,10 @@
+---
+apiVersion: project.openshift.io/v1
+kind: Project
+metadata:
+  annotations:
+    openshift.io/description: "obserIQ Collector"
+    openshift.io/display-name: "observiq"
+    openshift.io/node-selector: ""
+    openshift.io/requester: system:admin
+  name: observiq

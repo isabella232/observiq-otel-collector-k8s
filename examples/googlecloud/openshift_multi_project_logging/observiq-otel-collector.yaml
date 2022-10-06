@@ -1,0 +1,204 @@
+# yamllint disable rule:line-length
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: observiq-otel-collector
+  namespace: observiq
+  labels:
+    app: observiq-otel-collector
+data:
+  collector.yaml: |
+    receivers:
+      plugin/container:
+        path: /etc/otel/plugins/container_logs.yaml
+        parameters:
+          log_source: file
+
+    processors:
+      k8sattributes:
+        auth_type: serviceAccount
+        passthrough: false
+        pod_association:
+        - from: resource_attribute
+          name: k8s.pod.uid
+        - from: resource_attribute
+          name: k8s.pod.name
+        filter:
+          node_from_env_var: ${KUBE_NODE_NAME}
+
+      resource:
+        attributes:
+        - key: k8s.cluster.name
+          value: "${K8S_CLUSTER}"
+          action: upsert
+
+      # Google requires k8s.cluster.name, cloud.region, cloud.availability_zone and
+      # cloud.platform in order to map to container, pod, node, and cluster resource types.
+      resource/mapping:
+        attributes:
+        - key: cloud.region
+          value: us-east1
+          action: insert
+        - key: cloud.availability_zone
+          value: us-east1-b
+          action: insert
+        - key: cloud.platform
+          value: gcp_kubernetes_engine
+          action: insert
+
+      batch:
+        send_batch_max_size: 200
+        send_batch_size: 200
+        timeout: 2s
+
+      routing:
+        attribute_source: resource
+        from_attribute: k8s.namespace.name
+        default_exporters:
+        - logging
+        table:
+        - value: dev
+          exporters:
+            - googlecloud/dev
+            - logging
+        - value: stage
+          exporters:
+            - googlecloud/stage
+            - logging
+        - value: prod
+          exporters:
+            - googlecloud/prod
+            - logging
+
+    exporters:
+      googlecloud/dev:
+        project: multi-project-logging-dev
+
+      googlecloud/stage:
+        project: multi-project-logging-stage
+
+      googlecloud/prod:
+        project: multi-project-logging-prod
+
+      logging:
+
+    extensions:
+      file_storage:
+        directory: /var/lib/observiq/otelcol/node
+
+    service:
+      extensions:
+        - file_storage
+      pipelines:
+        logs:
+          receivers:
+            - plugin/container
+          processors:
+            - k8sattributes
+            - resource
+            - resource/mapping
+            - batch
+            - routing
+          exporters:
+            - googlecloud/dev
+            - googlecloud/stage
+            - googlecloud/prod
+            - logging
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: observiq-otel-collector
+  namespace: observiq
+  labels:
+    app: observiq-otel-collector
+spec:
+  selector:
+    matchLabels:
+      app: observiq-otel-collector
+  template:
+    metadata:
+      labels:
+        app: observiq-otel-collector
+    spec:
+      containers:
+        - args:
+            - --config=/conf/collector.yaml
+          env:
+            - name: GOOGLE_APPLICATION_CREDENTIALS
+              value: /otel/credentials.json
+            - name: K8S_CLUSTER
+              value: minishift
+            - name: KUBE_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: spec.nodeName
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.name
+          image: observiq/observiq-otel-collector:1.9.0
+          imagePullPolicy: IfNotPresent
+          name: otc-container
+          resources:
+            requests:
+              cpu: 250m
+              memory: 250Mi
+          volumeMounts:
+            - mountPath: /conf
+              name: otc-internal
+            - mountPath: /var/log
+              name: varlog
+            - mountPath: /var/lib/docker/containers
+              name: dockerlogs
+            - mountPath: /var/lib/observiq/otelcol/node
+              name: storage
+            - mountPath: /otel
+              name: gcp-credentials
+      dnsPolicy: ClusterFirstWithHostNet
+      # Required for k8sattributes processor
+      hostNetwork: true
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext:
+        # Must be able to mount host volume and read logs
+        # from filesystem and journald.
+        runAsUser: 0
+      serviceAccount: observiq-otel-collector
+      serviceAccountName: observiq-otel-collector
+      tolerations:
+        - key: node-role.kubernetes.io/master
+          effect: NoSchedule
+      terminationGracePeriodSeconds: 30
+      volumes:
+        - configMap:
+            defaultMode: 420
+            items:
+              - key: collector.yaml
+                path: collector.yaml
+            name: observiq-otel-collector
+          name: otc-internal
+        - hostPath:
+            path: /var/log
+            type: ""
+          name: varlog
+        - hostPath:
+            path: /var/lib/docker/containers
+            type: ""
+          name: dockerlogs
+        - hostPath:
+            path: /var/lib/observiq/otelcol/node
+            type: ""
+          name: storage
+        - name: gcp-credentials
+          secret:
+            defaultMode: 420
+            secretName: gcp-credentials
+  updateStrategy:
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+    type: RollingUpdate
