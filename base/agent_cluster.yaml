@@ -69,7 +69,7 @@ spec:
           exporters:
             - otlp
 
-  image: observiq/observiq-otel-collector:1.9.0
+  image: observiq/observiq-otel-collector:1.9.2
   serviceAccount: observiq-otel-collector
   resources:
     requests:
