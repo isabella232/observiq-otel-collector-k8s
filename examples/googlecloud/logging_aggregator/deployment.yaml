@@ -1,0 +1,139 @@
+# yamllint disable rule:line-length
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: observiq-gateway
+  namespace: default
+  labels:
+    app: observiq-otel-gateway
+    stack: observiq
+spec:
+  ports:
+    - port: 4317
+      protocol: TCP
+      targetPort: 4317
+  selector:
+    app: observiq-otel-gateway
+    stack: observiq
+  sessionAffinity: None
+  type: ClusterIP
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: observiq-otel-gateway
+  labels:
+    app: observiq-otel-gateway
+    stack: observiq
+data:
+  collector.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+
+    processors:
+      # If running within GKE, try to detect the
+      # cloud provider, region, availability zone, cluster name.
+      resourcedetection:
+        detectors: [gke]
+        timeout: 2s
+        override: true
+
+      # Google requires k8s.cluster.name, cloud.region, cloud.availability_zone and
+      # cloud.platform in order to map to container, pod, node, and cluster resource types.
+      resource:
+        attributes:
+        - key: cloud.region
+          value: us-east1
+          action: insert
+        - key: cloud.availability_zone
+          value: us-east1-b
+          action: insert
+        - key: cloud.platform
+          value: gcp_kubernetes_engine
+          action: insert
+        - key: k8s.cluster.name
+          value: "${K8S_CLUSTER}"
+          action: upsert
+
+      batch:
+        send_batch_max_size: 200
+        send_batch_size: 200
+
+    exporters:
+      googlecloud:
+
+      logging:
+
+    service:
+      pipelines:
+        logs:
+          receivers:
+            - otlp
+          processors:
+            - resourcedetection
+            - resource
+            - batch
+          exporters:
+            - logging
+            - googlecloud
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: observiq-otel-gateway
+    stack: observiq
+  name: observiq-otel-gateway
+  namespace: default
+spec:
+  replicas: 2 # TODO(jsirianni) Use HPA
+  selector:
+    matchLabels:
+      app: observiq-otel-gateway
+      stack: observiq
+  template:
+    metadata:
+      labels:
+        app: observiq-otel-gateway
+        stack: observiq
+    spec:
+      containers:
+        - name: otc-container
+          args:
+            - --config=/conf/collector.yaml
+          env:
+            - name: GOOGLE_APPLICATION_CREDENTIALS
+              value: /otel/credentials.json
+            - name: K8S_CLUSTER
+              value: minikube
+          image: observiq/observiq-otel-collector:1.9.0
+          imagePullPolicy: IfNotPresent
+          resources:
+            requests:
+              cpu: 100m
+              memory: 100Mi
+          volumeMounts:
+            - mountPath: /conf
+              name: otc-internal
+            - mountPath: /otel/credentials.json
+              name: gcp-credentials
+              subPath: credentials.json
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      terminationGracePeriodSeconds: 30
+      volumes:
+        - configMap:
+            defaultMode: 420
+            items:
+              - key: collector.yaml
+                path: collector.yaml
+            name: observiq-otel-gateway
+          name: otc-internal
+        - name: gcp-credentials
+          secret:
+            defaultMode: 420
+            secretName: gcp-credentials
