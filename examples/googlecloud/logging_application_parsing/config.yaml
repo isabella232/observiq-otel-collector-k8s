@@ -1,0 +1,417 @@
+# yamllint disable rule:line-length
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: observiq-otel-collector
+  labels:
+    app: observiq-otel-collector
+data:
+  collector.yaml: |
+    receivers:
+      filelog/container:
+        storage: file_storage/container
+        include:
+            - "/var/log/containers/*.log"
+        start_at: end
+        exclude:
+          - "/var/log/containers/observiq-*"
+        operators:
+          # Support docker and containerd runtimes, which have different
+          # logging formats.
+          - type: router
+            routes:
+              - expr: body matches "^{.*}\\s*$"
+                output: docker_parser
+            default: containerd_parser
+
+          # The raw message looks like this:
+          # {"log":"I0618 14:30:29.641678       1 logs.go:59] http: TLS handshake error from 192.168.49.2:56222: EOF\n","stream":"stderr","time":"2022-06-18T14:30:29.641732743Z"}
+          - type: json_parser
+            id: docker_parser
+            timestamp:
+              parse_from: attributes.time
+              layout: '%Y-%m-%dT%H:%M:%S.%sZ'
+            output: log-to-body
+
+          # The raw message looks like this:
+          # 2022-06-18T16:52:59.639114537Z stdout F {"message":"registered Stackdriver tracing","severity":"info","timestamp":"2022-06-18T16:52:59.639034532Z"}
+          - id: containerd_parser
+            type: regex_parser
+            regex: '^(?P<time>[^\s]+) (?P<stream>\w+) (?P<partial>\w)?(?P<log>.*)'
+          - type: recombine
+            source_identifier: attributes["log.file.name"]
+            combine_field: attributes.log
+            is_last_entry: "attributes.partial == 'F'"
+          - type: remove
+            field: attributes.partial
+          - id: time_parser_router
+            type: router
+            routes:
+              # Containerd can have a couple timestamp formats depending if the node has local time set
+              - output: local_containerd_timestamp_parser
+                expr: 'attributes.time != nil and attributes.time matches "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3,9}[\\+-]\\d{2}:\\d{2}"'
+              - output: utc_containerd_timestamp_parser
+                expr: 'attributes.time != nil and attributes.time matches "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3,9}Z"'
+
+          - type: time_parser
+            id: local_containerd_timestamp_parser
+            parse_from: attributes.time
+            layout: '%Y-%m-%dT%H:%M:%S.%s%j'
+            output: log-to-body
+
+          - type: time_parser
+            id: utc_containerd_timestamp_parser
+            parse_from: attributes.time
+            layout: '%Y-%m-%dT%H:%M:%S.%sZ'
+            output: log-to-body
+
+          # The raw body does not contain anything useful considering timestamp has been promotoed to
+          # the log entries timestamp, therefore we move attributes.log (the actual container log message)
+          # to body.
+          - type: move
+            id: log-to-body
+            from: attributes.log
+            to: body
+
+          # Detect pod, namespace, and container names from the file name.
+          - type: regex_parser
+            regex: '^(?P<pod>[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)_(?P<namespace>[^_]+)_(?P<container>.+)-'
+            parse_from: attributes["log.file.name"]
+            cache:
+              size: 500
+
+          # Semantic conventions for k8s
+          # https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/resource/semantic_conventions/k8s.md#kubernetes
+          - type: move
+            from: attributes.pod
+            to: resource["k8s.pod.name"]
+          - type: move
+            from: attributes.namespace
+            to: resource["k8s.namespace.name"]
+          - type: move
+            from: attributes.container
+            to: resource["k8s.container.name"]
+
+          # # # # # # # # # # # # # # # # # # # # #
+          # Add operators here for custom parsing #
+          # # # # # # # # # # # # # # # # # # # # #
+
+          # Route to parsers based on pod name
+          - type: router
+            default: add_log_type
+            routes:
+              - expr: 'resource["k8s.pod.name"] matches "adservice-*"'
+                output: adservice_parser
+              - expr: 'resource["k8s.pod.name"] matches "checkoutservice-*"'
+                output: checkoutservice_parser
+              - expr: 'resource["k8s.pod.name"] matches "cartservice-*"'
+                output: cartservice_filter
+              - expr: 'resource["k8s.pod.name"] matches "currencyservice-*"'
+                output: currencyservice_parser
+              - expr: 'resource["k8s.pod.name"] matches "emailservice-*"'
+                output: emailservice_parser
+              - expr: 'resource["k8s.pod.name"] matches "frontend-*"'
+                output: frontend_filter
+              - expr: 'resource["k8s.pod.name"] matches "loadgenerator-*"'
+                output: loadgenerator_filter
+              - expr: 'resource["k8s.pod.name"] matches "paymentservice-*"'
+                output: paymentservice_parser
+              - expr: 'resource["k8s.pod.name"] matches "productcatalogservice-*"'
+                output: productcatalogservice_parser
+              - expr: 'resource["k8s.pod.name"] matches "recommendationservice-*"'
+                output: recommendationservice_parser
+              - expr: 'resource["k8s.pod.name"] matches "shippingservice-*"'
+                output: shippingservice_parser
+
+          # {"instant":{"epochSecond":1665168212,"nanoOfSecond":569236073},"thread":"grpc-default-executor-12",
+          # "level":"INFO","loggerName":"hipstershop.AdService","message":"received ad request (context_words=[footwear])",
+          # "endOfBatch":false,"loggerFqcn":"org.apache.logging.log4j.spi.AbstractLogger","threadId":31,"threadPriority":5,
+          # "logging.googleapis.com/trace":"${ctx:traceId}","logging.googleapis.com/spanId":"${ctx:spanId}",
+          # "logging.googleapis.com/traceSampled":"${ctx:traceSampled}","time":"2022-10-07T18:43:32.569Z"}
+          - type: json_parser
+            id: adservice_parser
+            parse_from: body
+            parse_to: body
+            severity:
+              parse_from: body.level
+            timestamp:
+              parse_from: body.time
+              layout_type: gotime
+              layout: 2006-01-02T15:04:05Z07:00
+            output: add_log_type
+
+          # {"message":"starting to listen on tcp: \"[::]:5050\"","severity":"info","timestamp":"2022-10-07T18:09:21.360544069Z"}
+          - type: json_parser
+            id: checkoutservice_parser
+            parse_from: body
+            parse_to: body
+            severity:
+              parse_from: body.severity
+            timestamp:
+              parse_from: body.timestamp
+              layout_type: gotime
+              layout: 2006-01-02T15:04:05Z07:00
+            output: add_log_type
+
+          # AddItemAsync called with userId=f5a4f467-b089-4991-af05-3ece6b700b69, productId=9SIQT8TOJO, quantity=4
+          - type: filter
+            id: cartservice_filter
+            expr: body matches "Checking CartService Health"
+            drop_ratio: 1.0
+            output: cartservice_regex_parser
+          - type: regex_parser
+            id: cartservice_regex_parser
+            parse_from: body
+            parse_to: body
+            regex: '(?P<message>.*)\s+with\s*(?P<values>.*)'
+            output: cartservice_kv_parser
+          - type: key_value_parser
+            id: cartservice_kv_parser
+            parse_from: body.values
+            parse_to: body
+            delimiter: "="
+            pair_delimiter: ", "
+            output: cartservice_cleanup
+          - type: remove
+            id: cartservice_cleanup
+            field: body.values
+            output: add_log_type
+
+          # {"level":30,"time":1665171693772,"pid":1,"hostname":"currencyservice-8448776d74-6prh4",
+          # "name":"currencyservice-server","message":"conversion request successful"}
+          - type: json_parser
+            id: currencyservice_parser
+            parse_from: body
+            parse_to: body
+            severity:
+              parse_from: body.level
+              mapping:
+                info: 30
+                warn: 40
+                error: 50
+            timestamp:
+              parse_from: body.time
+              layout_type: epoch
+              layout: ms
+            output: add_log_type
+
+          # {"timestamp": 1665171976.3249784, "severity": "INFO", "name": "emailservice-server",
+          # "message": "A request to send order confirmation email to someone@example.com has been received."}
+          - type: json_parser
+            id: emailservice_parser
+            parse_from: body
+            parse_to: body
+            output: emailservice_severity_parser
+          - type: severity_parser
+            id: emailservice_severity_parser
+            parse_from: body.severity
+            output: emailservice_time_parser
+          - type: time_parser
+            id: emailservice_time_parser
+            parse_from: body.timestamp
+            layout_type: epoch
+            layout: s.ns
+            output: add_log_type
+
+          # {"http.req.id":"4a92d636-f3f5-43aa-ab52-c56c13247933","http.req.method":"GET","http.req.path":"/cart","message":"request started",
+          # "session":"223eb18f-21fe-4f3f-973e-139cf767be22","severity":"debug","timestamp":"2022-10-07T20:05:36.452087498Z"}
+          - type: filter
+            id: frontend_filter
+            expr: body matches "env platform is either empty or invalid"
+            drop_ratio: 1.0
+            output:  frontend_parser
+          - type: json_parser
+            id: frontend_parser
+            parse_from: body
+            parse_to: body
+            output: frontend_time_parser
+          - type: time_parser
+            id: frontend_time_parser
+            parse_from: body.timestamp
+            layout_type: gotime
+            layout: 2006-01-02T15:04:05Z07:00
+            output: frontend_severity_router
+          - type: router
+            id: frontend_severity_router
+            default: frontend_severity_parser
+            routes:
+              - expr: 'body["http.resp.status"] != nil'
+                output: severity_status_parser
+          - type: severity_parser
+            id: severity_status_parser
+            mapping:
+              info: 2xx
+              info2: 3xx
+              warn: 4xx
+              error: 5xx
+            parse_from: body["http.resp.status"]
+            output: add_log_type
+          - type: severity_parser
+            id: frontend_severity_parser
+            parse_from: body.severity
+            output: add_log_type
+
+          # Filter can be used to remove entries. In this example, we are removing 100% of the logs
+          # and might be better served by using the "exclude" option in the filelog receiver.
+          - type: filter
+            id: loadgenerator_filter
+            drop_ratio: 1.0
+            expr: 'true'
+
+          # {"level":30,"time":1665174501252,"pid":1,"hostname":"paymentservice-66bb699fb4-bpw4z","name":"paymentservice-server",
+          # "message":"PaymentService#Charge invoked with request {\"amount\":{\"currency_code\":\"USD\",\"units\":\"103\",\"nanos\":940000000},
+          # \"credit_card\":{\"credit_card_number\":\"4432-8015-6152-0454\",\"credit_card_cvv\":672,\"credit_card_expiration_year\":2039,
+          # \"credit_card_expiration_month\":1}}"}
+          - type: json_parser
+            id: paymentservice_parser
+            parse_from: body
+            parse_to: body
+            output: paymentservice_severity_parser
+          - type: severity_parser
+            id: paymentservice_severity_parser
+            parse_from: body.level
+            mapping:
+              info: 30
+              warn: 40
+              error: 50
+            output: paymentservice_time_parser
+          - type: time_parser
+            id: paymentservice_time_parser
+            parse_from: body.time
+            layout_type: epoch
+            layout: ms
+            output: add_log_type
+
+          # {"message":"Stats disabled.","severity":"info","timestamp":"2022-10-10T14:08:51.980157831Z"}
+          - type: json_parser
+            id: productcatalogservice_parser
+            parse_from: body
+            parse_to: body
+            output: productcatalogservice_severity_parser
+          - type: severity_parser
+            id: productcatalogservice_severity_parser
+            parse_from: body.severity
+            output: productcatalogservice_time_parser
+          - type: time_parser
+            id: productcatalogservice_time_parser
+            parse_from: body.timestamp
+            layout_type: gotime
+            layout: 2006-01-02T15:04:05Z07:00
+            output: add_log_type
+
+          # {"timestamp": 1665410922.9106255, "severity": "INFO", "name": "recommendationservice-server", "message": "listening on port: 8080"}
+          # {"timestamp": 1665412866.977042, "severity": "INFO", "name": "recommendationservice-server",
+          # "message": "[Recv ListRecommendations] product_ids=['6E92ZMYYFZ', '0PUK6V6EV0', 'L9ECAV7KIM', '66VCHSJNUP', '9SIQT8TOJO']"}
+          - type: json_parser
+            id: recommendationservice_parser
+            parse_from: body
+            parse_to: body
+            output: recommendationservice_severity_parser
+          - type: severity_parser
+            id: recommendationservice_severity_parser
+            parse_from: body.severity
+            output: recommendationservice_time_parser
+          - type: time_parser
+            id: recommendationservice_time_parser
+            parse_from: body.timestamp
+            layout_type: epoch
+            layout: s.ns
+            output: recommendationservice_router
+          - type: router
+            id: recommendationservice_router
+            default: add_log_type
+            routes:
+              - expr: body.message matches "Recv ListRecommendations] product_ids="
+                output: recommendationservice_message_parser
+          # [Recv ListRecommendations] product_ids=['6E92ZMYYFZ', '0PUK6V6EV0', 'L9ECAV7KIM', '66VCHSJNUP', '9SIQT8TOJO']
+          # body.message: Recv ListRecommendations
+          # body.product_ids: ['6E92ZMYYFZ', '0PUK6V6EV0', 'L9ECAV7KIM', '66VCHSJNUP', '9SIQT8TOJO']
+          - type: regex_parser
+            id: recommendationservice_message_parser
+            regex: '\[(?P<message>[^(...)]+)\] product_ids=(?P<product_ids>.*)'
+            parse_from: body.message
+            parse_to: body
+            output: add_log_type
+
+          # {"message":"[GetQuote] completed request","severity":"info","timestamp":"2022-10-10T15:19:21.214990678Z"}
+          - type: json_parser
+            id: shippingservice_parser
+            parse_from: body
+            parse_to: body
+            output: shippingservice_severity_parser
+          - type: severity_parser
+            id: shippingservice_severity_parser
+            parse_from: body.severity
+            output: shippingservice_time_parser
+          - type: time_parser
+            id: shippingservice_time_parser
+            parse_from: body.timestamp
+            layout_type: gotime
+            layout: 2006-01-02T15:04:05Z07:00
+            output: add_log_type
+
+          - type: add
+            id: add_log_type
+            field: attributes.log_type
+            value: "k8s.container_logs"
+
+    processors:
+      k8sattributes:
+        auth_type: serviceAccount
+        passthrough: false
+        pod_association:
+        - from: resource_attribute
+          name: k8s.pod.uid
+        - from: resource_attribute
+          name: k8s.pod.name
+        filter:
+            node_from_env_var: ${KUBE_NODE_NAME}
+
+      resource:
+        attributes:
+        - key: k8s.cluster.name
+          value: "${K8S_CLUSTER}"
+          action: upsert
+
+      # Google requires k8s.cluster.name, cloud.region, cloud.availability_zone and
+      # cloud.platform in order to map to container, pod, node, and cluster resource types.
+      resource/mapping:
+        attributes:
+        - key: cloud.region
+          value: us-east1
+          action: insert
+        - key: cloud.availability_zone
+          value: us-east1-b
+          action: insert
+        - key: cloud.platform
+          value: gcp_kubernetes_engine
+          action: insert
+
+      batch:
+        send_batch_max_size: 200
+        send_batch_size: 200
+
+    exporters:
+      googlecloud:
+      logging:
+
+    extensions:
+      file_storage/container:
+        directory: /var/lib/observiq/otelcol/node
+
+    service:
+      extensions:
+        - file_storage/container
+      pipelines:
+        logs:
+          receivers:
+            - filelog/container
+          processors:
+            - k8sattributes
+            - resource
+            - resource/mapping
+            - batch
+          exporters:
+            - googlecloud
+            - logging
