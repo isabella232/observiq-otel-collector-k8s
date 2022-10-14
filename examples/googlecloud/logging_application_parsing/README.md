@@ -1,19 +1,35 @@
 # Google Cloud Logging (Custom Parsing)
 
 This example can be used to ship logs from any Kubernetes cluster to Google Cloud.
-This example demonstrates how to parse individual application logs, which is useful if you want to
-derive a log entry's severity and timestamp from the application log as opposed to the severity and timestamp set
-in the container runtime's log "wrapper".
 
-## Example
+- [Objective](#objective)
+- [How Does Custom Parsing Work?](#how-does-custom-parsing-work-)
+- [Usage](#usage)
+  * [Authentication](#authentication)
+  * [Set Cluster Name](#set-cluster-name)
+  * [Deploy](#deploy)
+    + [Example Microservices](#example-microservices)
+    + [Vanilla Configuration](#vanilla-configuration)
+    + [Custom Configuration](#custom-configuration)
 
-The `currency` service logs the following to stdout:
+## Objective
+
+In order to handle abitrary application logs, vanilla Kubernetes log parsing is generic in nature. Advanced users will
+parse their individual application logs.
+
+This example demonstrates how to parse individual application logs in a microservice environment, where each application has a
+different timestamp, severity, and message format.
+
+## How Does Custom Parsing Work?
+
+An application running within a container will write a log to `stdout` or `sterr`. In this example, the log is structured
+and contains useful fields such as `level` and `time`.
 
 ```json
 {"level":30,"time":1665416957021,"pid":1,"hostname":"currencyservice-8448776d74-rpl9s","name":"currencyservice-server","message":"conversion request successful"}
 ```
 
-The docker runtime captures the stdout stream and writes the following to file using the `json-file` log driver (default log driver)
+The container runtime captures the stdout stream and writes the following to a file in `/var/log/containers`. For example, when using the `docker` container runtime, the `json-file` log driver (default log driver) will output something like this:
 
 ```json
 {"log":"{\"level\":30,\"time\":1665416957021,\"pid\":1,\"hostname\":\"currencyservice-8448776d74-rpl9s\",\"name\":\"currencyservice-server\",\"message\":\"conversion request successful\"}\n","stream":"stdout","time":"2022-10-10T15:49:17.021137708Z"}
@@ -24,14 +40,14 @@ The docker runtime wraps the application's log with the following fields:
 - stream: Stdout or sterr
 - time: The time the log was captured from the application
 
-When the filelog receiver reads a line from a file, the output entry looks like this:
+When the `filelog` receiver reads a line from a file, the output entry looks like this:
 - timestamp: nil
 - severity: nil
 - body: `{"log":"{\"level\":30,\"time\":1665416957021,\"pid\":1,\"hostname\":\"currencyservice-8448776d74-rpl9s\",\"name\":\"currencyservice-server\",\"message\":\"conversion request successful\"}\n","stream":"stdout","time":"2022-10-10T15:49:17.021137708Z"}`
 
-The generic solution is to parse this entry with the `json_parser` and use the `time` field set by the docker runtime
-as the log entries timestamp. Next we move `attributes.log` to `body`, as the `log` field contains the actual application log and
-we no longer require the raw entry that is currently set to `body`.
+The generic solution is to parse this entry with the `json_parser` and use the `time` field to set the entry's timestamp.
+Next we move `attributes.log` to `body`, as the `log` field contains the actual application log and we no longer require 
+the raw entry that is currently set to `body`.
 
 ```yaml
 - type: json_parser
@@ -54,7 +70,7 @@ This will output the following log entry:
   - stream: stdout
   - time: 2022-10-10T15:49:17.021137708Z
 
-While this solution will work for any application running within the cluster, it may be ideal to parse the application
+While this solution will work for **any application** running within the cluster, it may be ideal to parse the application
 log further. To do this, we add custom parsing:
 
 First, we implement a `router` operator, which will determine which operator to
@@ -107,7 +123,7 @@ will match the application log.
 
 Update the configuration to reflect your environment.
 
-**Authentication**
+### Authentication
 
 If running **outside of GCP**, deploy Google credentials:
 ```bash
@@ -115,7 +131,7 @@ kubectl create secret generic gcp-credentials \
     --from-file=credentials.json
 ```
 
-**Set Cluster Name**
+### Set Cluster Name
 
 Edit `daemonset.yaml` and update the cluster name environment variable. This is a "friendly" name that
 can be searched on in the Cloud Logging interface.
@@ -125,7 +141,9 @@ can be searched on in the Cloud Logging interface.
   value: minikube
 ```
 
-**Deploy**
+### Deploy
+
+#### Example Microservices
 
 Deploy the custom application microservices:
 
@@ -133,9 +151,39 @@ Deploy the custom application microservices:
 kubectl apply -f custom-apps.yaml
 ```
 
-Deploy the collector configmap and daemonset:
+#### Vanilla Configuration
+
+Deploy the "vanilla" config map:
 
 ```bash
-kubectl apply -f config.yaml
+kubectl apply -f config.vanilla.yaml 
+```
+
+Deploy the collector daemonset:
+
+```bash
 kubectl apply -f daemonset.yaml
 ```
+
+Notice that logs come into Google Cloud in their unparsed form with the `default` severity.
+
+![vanilla](./assets/vanilla.png)
+
+#### Custom Configuration
+
+Next, deploy the "custom" config map
+
+```bash
+kubectl apply -f config.custom.yaml 
+```
+
+Restart the collector
+
+```bash
+kubectl rollout restart ds/observiq-otel-collector
+```
+
+Notice that logs come into Google Cloud in their parsed form. Severity and timestamp fields are set
+correctly.
+
+![custom](./assets/custom.png)

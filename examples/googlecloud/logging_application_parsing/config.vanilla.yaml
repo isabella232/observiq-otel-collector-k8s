@@ -1,0 +1,159 @@
+# yamllint disable rule:line-length
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: observiq-otel-collector
+  labels:
+    app: observiq-otel-collector
+data:
+  collector.yaml: |
+    receivers:
+      filelog/container:
+        storage: file_storage/container
+        include:
+            - "/var/log/containers/*.log"
+        start_at: end
+        exclude:
+          - "/var/log/containers/observiq-*"
+        operators:
+          # Support docker and containerd runtimes, which have different
+          # logging formats.
+          - type: router
+            routes:
+              - expr: body matches "^{.*}\\s*$"
+                output: docker_parser
+            default: containerd_parser
+
+          # The raw message looks like this:
+          # {"log":"I0618 14:30:29.641678       1 logs.go:59] http: TLS handshake error from 192.168.49.2:56222: EOF\n","stream":"stderr","time":"2022-06-18T14:30:29.641732743Z"}
+          - type: json_parser
+            id: docker_parser
+            timestamp:
+              parse_from: attributes.time
+              layout: '%Y-%m-%dT%H:%M:%S.%sZ'
+            output: log-to-body
+
+          # The raw message looks like this:
+          # 2022-06-18T16:52:59.639114537Z stdout F {"message":"registered Stackdriver tracing","severity":"info","timestamp":"2022-06-18T16:52:59.639034532Z"}
+          - id: containerd_parser
+            type: regex_parser
+            regex: '^(?P<time>[^\s]+) (?P<stream>\w+) (?P<partial>\w)?(?P<log>.*)'
+          - type: recombine
+            source_identifier: attributes["log.file.name"]
+            combine_field: attributes.log
+            is_last_entry: "attributes.partial == 'F'"
+          - type: remove
+            field: attributes.partial
+          - id: time_parser_router
+            type: router
+            routes:
+              # Containerd can have a couple timestamp formats depending if the node has local time set
+              - output: local_containerd_timestamp_parser
+                expr: 'attributes.time != nil and attributes.time matches "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3,9}[\\+-]\\d{2}:\\d{2}"'
+              - output: utc_containerd_timestamp_parser
+                expr: 'attributes.time != nil and attributes.time matches "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3,9}Z"'
+
+          - type: time_parser
+            id: local_containerd_timestamp_parser
+            parse_from: attributes.time
+            layout: '%Y-%m-%dT%H:%M:%S.%s%j'
+            output: log-to-body
+
+          - type: time_parser
+            id: utc_containerd_timestamp_parser
+            parse_from: attributes.time
+            layout: '%Y-%m-%dT%H:%M:%S.%sZ'
+            output: log-to-body
+
+          # The raw body does not contain anything useful considering timestamp has been promotoed to
+          # the log entries timestamp, therefore we move attributes.log (the actual container log message)
+          # to body.
+          - type: move
+            id: log-to-body
+            from: attributes.log
+            to: body
+
+          # Detect pod, namespace, and container names from the file name.
+          - type: regex_parser
+            regex: '^(?P<pod>[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)_(?P<namespace>[^_]+)_(?P<container>.+)-'
+            parse_from: attributes["log.file.name"]
+            cache:
+              size: 500
+
+          # Semantic conventions for k8s
+          # https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/resource/semantic_conventions/k8s.md#kubernetes
+          - type: move
+            from: attributes.pod
+            to: resource["k8s.pod.name"]
+          - type: move
+            from: attributes.namespace
+            to: resource["k8s.namespace.name"]
+          - type: move
+            from: attributes.container
+            to: resource["k8s.container.name"]
+
+          - type: add
+            id: add_log_type
+            field: attributes.log_type
+            value: "k8s.container_logs"
+
+    processors:
+      k8sattributes:
+        auth_type: serviceAccount
+        passthrough: false
+        pod_association:
+        - from: resource_attribute
+          name: k8s.pod.uid
+        - from: resource_attribute
+          name: k8s.pod.name
+        filter:
+            node_from_env_var: ${KUBE_NODE_NAME}
+
+      resource:
+        attributes:
+        - key: k8s.cluster.name
+          value: "${K8S_CLUSTER}"
+          action: upsert
+
+      # Google requires k8s.cluster.name, cloud.region, cloud.availability_zone and
+      # cloud.platform in order to map to container, pod, node, and cluster resource types.
+      resource/mapping:
+        attributes:
+        - key: cloud.region
+          value: us-east1
+          action: insert
+        - key: cloud.availability_zone
+          value: us-east1-b
+          action: insert
+        - key: cloud.platform
+          value: gcp_kubernetes_engine
+          action: insert
+
+      batch:
+        send_batch_max_size: 200
+        send_batch_size: 200
+
+    exporters:
+      googlecloud:
+      logging:
+
+    extensions:
+      file_storage/container:
+        directory: /var/lib/observiq/otelcol/node
+
+    service:
+      extensions:
+        - file_storage/container
+      pipelines:
+        logs:
+          receivers:
+            - filelog/container
+          processors:
+            - k8sattributes
+            - resource
+            - resource/mapping
+            - batch
+          exporters:
+            - googlecloud
+            - logging
