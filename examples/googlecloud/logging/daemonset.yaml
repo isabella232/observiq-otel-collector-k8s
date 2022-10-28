@@ -297,8 +297,3 @@ spec:
           secret:
             defaultMode: 420
             secretName: gcp-credentials
-  updateStrategy:
-    rollingUpdate:
-      maxSurge: 0
-      maxUnavailable: 1
-    type: RollingUpdate
