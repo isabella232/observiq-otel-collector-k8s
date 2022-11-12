@@ -1,0 +1,103 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: observiq-statsd-collector-ds
+data:
+  config.yaml: |
+    receivers:
+      statsd:
+        endpoint: 0.0.0.0:8125
+        aggregation_interval: 60s
+
+    processors:
+      # Batch metrics before using groupbyattrs.
+      batch:
+
+      # Statsd clients should be tagging their metrics
+      # with k8s.pod.name and k8s.namespace.name. groupbyattrs
+      # will not only group the metrics but will "promote" k8s.pod.name
+      # and k8s.namespace.name from metrics labels to metrics resource
+      # attributes. These resources are required by Google for mapping
+      # to k8s_pod monitored resource type, allowing you to search for 
+      # statsd metrics under the "Kubernetes Pod" metric namespace / prefix.
+      groupbyattrs:
+        - keys:
+            - k8s.pod.name
+            - k8s.namespace.name
+
+    exporters:
+      otlp:
+        endpoint: observiq-gateway:4317
+        tls:
+          insecure: true
+      logging:
+
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+        path: /
+
+    service:
+      extensions:
+        - health_check
+      pipelines:
+        metrics:
+          receivers:
+            - statsd
+          processors:
+            - batch
+            - groupbyattrs
+          exporters:
+            - otlp
+            - logging
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: observiq-statsd-collector-ds
+spec:
+  selector:
+    matchLabels:
+      app: observiq-statsd-collector-ds
+  template:
+    metadata:
+      labels:
+        app: observiq-statsd-collector-ds
+    spec:
+      containers:
+        - name: otc-container
+          image: observiq/observiq-otel-collector:1.11.1
+          ports:
+            - containerPort: 8125
+              hostPort: 8125
+              protocol: UDP
+              name: statsd
+            - containerPort: 13133
+              protocol: TCP
+              name: health
+          readinessProbe:
+            httpGet:
+              path: /
+              port: health
+          livenessProbe:
+            httpGet:
+              path: /
+              port: health
+          resources:
+            requests:
+              cpu: 150m
+              memory: 150Mi
+            limits:
+              memory: 150Mi
+          volumeMounts:
+            - mountPath: /etc/otel/config.yaml
+              subPath: config.yaml
+              name: observiq-statsd-collector-ds
+      volumes:
+        - name: observiq-statsd-collector-ds
+          configMap:
+            name: observiq-statsd-collector-ds
+            items:
+              - key: config.yaml
+                path: config.yaml

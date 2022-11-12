@@ -9,13 +9,15 @@ to Google Cloud.
 - [Usage](#usage)
 - [Collectors](#collectors)
   * [gateway.yaml](#gatewayyaml)
-  * [collector.yaml](#collectoryaml)
+  * [collector-deployment.yaml](#collector-deploymentyaml)
+  * [collector-daemonset.yaml](#collector-daemonsetyaml)
   * [app-remote.yaml](#app-remoteyaml)
   * [app-sidecar.yaml](#app-sidecaryaml)
   * [app-sidecar-standalone.yaml](#app-sidecar-standaloneyaml)
 - [Architecture](#architecture)
   * [Side Car](#side-car)
   * [Deployment](#deployment)
+  * [Daemonset](#daemonset)
 - [FAQ](#faq)
 
 ## Setup
@@ -53,7 +55,7 @@ Deploy to your cluster.
 
 ```bash
 kubectl apply -f gateway.yaml
-kubectl apply -f collector.yaml
+kubectl apply -f collector-deployment.yaml
 kubectl apply -f app-remote.yaml
 kubectl apply -f app-sidecar.yaml
 kubectl apply -f app-sidecar-standalone.yaml
@@ -76,9 +78,25 @@ all metrics:
 
 These resources are required in order to map to `k8s_pod` [Monitored Resource Types](https://cloud.google.com/logging/docs/api/v2/resource-list).
 
-### collector.yaml
+### collector-deployment.yaml
 
-Collector with StatsD receiver and OTLP exporter.
+Collector deployment with StatsD receiver and OTLP exporter.
+StatsD clients access the collector(s) via a clusterIP service.
+
+This collector contains processors which convert the following
+metric labels (statsd tags) to resource attributes:
+- `k8s.pod.name`
+- `k8s.namespace.name`
+
+These tags are required in order to map to `k8s_pod` [Monitored Resource Types](https://cloud.google.com/logging/docs/api/v2/resource-list).
+
+### collector-daemonset.yaml
+
+Collector daemonset with StatsD receiver and OTLP exporter.
+The collector(s) are listening for StatsD metrics using a hostPort.
+StatsD clients forward metrics to their's node's IP address on the StatsD
+port. This allows all pods on a given node to forward metrics to the daemonset
+collector running on that same node.
 
 This collector contains processors which convert the following
 metric labels (statsd tags) to resource attributes:
@@ -89,7 +107,7 @@ These tags are required in order to map to `k8s_pod` [Monitored Resource Types](
 
 ### app-remote.yaml
 
-StatsD example application, which forwards metrics to `collector.yaml`'s 
+StatsD example application, which forwards metrics to `collector-deployment.yaml`'s 
 clusterIP service `observiq-statsd-collector` on port `8125/udp`.
 
 StatsD metrics emitted by this deployment contain the following tags:
@@ -184,9 +202,17 @@ Application pod --> StatsD collector --> Google gateway collector --> Google Clo
     - `k8s.pod.name`
     - `k8s.namespace.name`
 
+### Daemonset
+
+The daemonset collector functions similar to the deployment collector. It scales up
+and down with the node pool instead of using a pod autoscaler.
+
+Daemonset is simpler, as it does not require a clusterIP servce or autoscaler, however, it may have a larger footprint than the deployment option because it requires that a collector
+run on every node.
+
 ## FAQ
 
-**Q: Can collector.yaml and gateway.yaml collectors be merged?**
+**Q: Can collector-deployment.yaml and gateway.yaml collectors be merged?**
 
 **A**: Yes. They are seperate collectors in order to maintain a seperation of duties. The statsd collector handles statsd metrics while the gateway collector handles mapping metrics to `k8s_pod` [Monitored Resource Type](https://cloud.google.com/logging/docs/api/v2/resource-list). It is important to retain the `batch`, `groupbyattrs`, `resource`, and `resourcedetection` processors. The `groupbyattrs` should come after `batch`, while batch should come after all other processors.
 
