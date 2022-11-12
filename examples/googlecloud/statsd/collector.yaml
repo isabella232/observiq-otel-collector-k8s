@@ -1,0 +1,149 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: observiq-statsd-collector
+data:
+  config.yaml: |
+    receivers:
+      statsd:
+        endpoint: 0.0.0.0:8125
+        aggregation_interval: 60s
+
+    processors:
+      # Batch metrics before using groupbyattrs.
+      batch:
+
+      # Statsd clients should be tagging their metrics
+      # with k8s.pod.name and k8s.namespace.name. groupbyattrs
+      # will not only group the metrics but will "promote" k8s.pod.name
+      # and k8s.namespace.name from metrics labels to metrics resource
+      # attributes. These resources are required by Google for mapping
+      # to k8s_pod monitored resource type, allowing you to search for 
+      # statsd metrics under the "Kubernetes Pod" metric namespace / prefix.
+      groupbyattrs:
+        - keys:
+            - k8s.pod.name
+            - k8s.namespace.name
+
+    exporters:
+      otlp:
+        endpoint: observiq-gateway:4317
+        tls:
+          insecure: true
+      logging:
+
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+        path: /
+
+    service:
+      extensions:
+        - health_check
+      pipelines:
+        metrics:
+          receivers:
+            - statsd
+          processors:
+            - batch
+            - groupbyattrs
+          exporters:
+            - otlp
+            - logging
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: observiq-statsd-collector
+spec:
+  selector:
+    matchLabels:
+      app: observiq-statsd-collector
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: observiq-statsd-collector
+    spec:
+      containers:
+        - name: otc-container
+          image: observiq/observiq-otel-collector:1.11.1
+          ports:
+            - containerPort: 8125
+              protocol: UDP
+              name: statsd
+            - containerPort: 13133
+              protocol: TCP
+              name: health
+          readinessProbe:
+            httpGet:
+              path: /
+              port: health
+          livenessProbe:
+            httpGet:
+              path: /
+              port: health
+          resources:
+            requests:
+              cpu: 150m
+              memory: 150Mi
+            limits:
+              memory: 150Mi
+          volumeMounts:
+            - mountPath: /etc/otel/config.yaml
+              subPath: config.yaml
+              name: observiq-statsd-collector
+      volumes:
+        - name: observiq-statsd-collector
+          configMap:
+            name: observiq-statsd-collector
+            items:
+              - key: config.yaml
+                path: config.yaml
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: observiq-statsd-collector
+  labels:
+    app: observiq-statsd-collector
+spec:
+  # Some StatsD UDP clients will re-use the same source port for the 
+  # lifetime of the client, which means the clusterIP service will always
+  # route the connection to the same pod. This means load balancing among
+  # collector pods will be uneven if many statsd clients come online before
+  # the statsd autoscaler can scale up the collector pods.
+  #
+  # See https://github.com/kubernetes/kubernetes/issues/76517 for details.
+  # 
+  # It is possible that a clusterIP service with 'clusterIP: none' (headless service), and a client
+  # which re-resolves the service name on an interval, could be used to improve load balancing. This method
+  # works but can cause issues when sending metrics to Google. You will end up with two collectors receiving metrics
+  # from the same client within < 30 seconds of each datapoint. This will cause the Google API to reject the second
+  # set of metrics because they are considered duplicates. This is not a big deal, but it will polute the collector log.
+  ports:
+    - port: 8125
+      name: statsd
+      protocol: UDP
+  selector:
+    app: observiq-statsd-collector
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: observiq-statsd-collector
+spec:
+  maxReplicas: 10
+  minReplicas: 1
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: observiq-statsd-collector
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70

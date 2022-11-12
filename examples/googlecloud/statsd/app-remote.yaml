@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: statsd-remote
+spec:
+  minReadySeconds: 1
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app: statsd-remote
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: statsd-remote
+    spec:
+      containers:
+        - name: statsd
+          image: ghcr.io/jsirianni/go-statsd-example:0.0.5
+          imagePullPolicy: Always
+          resources:
+            limits:
+              memory: "50Mi"
+              cpu: 50m
+            requests:
+              memory: "50Mi"
+          env:
+            - name: STATSD_APP_NAME
+              value: api
+            - name: STATSD_HOST
+              value: "observiq-statsd-collector" # collector's clusterIP service name
+            - name: OTEL_INCLUDE_RESOURCES
+              value: "true"
+            - name: OTEL_RESOURCE_ATTRIBUTES_POD_NAME
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.name
+            - name: OTEL_RESOURCE_ATTRIBUTES_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.namespace

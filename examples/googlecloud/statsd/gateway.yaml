@@ -1,0 +1,163 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: observiq-gateway
+data:
+  config.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+
+    processors:
+      # These resources are required by Google for mapping
+      # to k8s_pod monitored resource type, allowing you to search for 
+      # statsd metrics under the "Kubernetes Pod" metric namespace / prefix.
+      # Cluster name is a "friendly" name used to identify the cluster.
+      # resourcedetection processor will override some of these values 
+      # if actual values are detected.
+      resource:
+        attributes:
+        - key: k8s.cluster.name
+          value: "${OTEL_RESOURCE_ATTRIBUTES_CLUSTER_NAME}"
+          action: upsert
+        - key: cloud.region
+          value: us-east1
+          action: insert
+        - key: cloud.availability_zone
+          value: us-east1-b
+          action: insert
+        - key: cloud.platform
+          value: gcp_kubernetes_engine
+          action: insert
+
+      # If running within GKE, try to detect the
+      # cloud provider, region, availability zone, cluster name.
+      resourcedetection:
+        detectors: [gke]
+        timeout: 2s
+        override: true
+
+      # Batch metrics before using groupbyattrs.
+      batch:
+
+    exporters:
+      googlecloud:
+      logging:
+
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+        path: /
+
+    service:
+      extensions:
+        - health_check
+      pipelines:
+        metrics:
+          receivers:
+            - otlp
+          processors:
+            - resource
+            - resourcedetection
+            - batch
+          exporters:
+            - googlecloud
+            - logging
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: observiq-gateway
+spec:
+  selector:
+    matchLabels:
+      app: observiq-gateway
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: observiq-gateway
+    spec:
+      containers:
+        - name: otc-container
+          image: observiq/observiq-otel-collector:1.11.1
+          ports:
+            - containerPort: 4317
+              protocol: TCP
+              name: otlp
+            - containerPort: 13133
+              protocol: TCP
+              name: health
+          readinessProbe:
+            httpGet:
+              path: /
+              port: health
+          livenessProbe:
+            httpGet:
+              path: /
+              port: health
+          env:
+            - name: OTEL_RESOURCE_ATTRIBUTES_CLUSTER_NAME
+              value: minikube
+            - name: GOOGLE_APPLICATION_CREDENTIALS
+              value: /otel/credentials.json
+          resources:
+            requests:
+              cpu: 100m
+              memory: 100Mi
+            limits:
+              memory: 100Mi
+          volumeMounts:
+            - mountPath: /etc/otel/config.yaml
+              subPath: config.yaml
+              name: observiq-gateway
+            - mountPath: /otel/credentials.json
+              name: gcp-credentials
+              subPath: credentials.json
+      volumes:
+        - name: observiq-gateway
+          configMap:
+            name: observiq-gateway
+            items:
+              - key: config.yaml
+                path: config.yaml
+        - name: gcp-credentials
+          secret:
+            defaultMode: 420
+            secretName: gcp-credentials
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: observiq-gateway
+  labels:
+    app: observiq-gateway
+spec:
+  ports:
+    - port: 4317
+      name: otlp
+      protocol: TCP
+  selector:
+    app: observiq-gateway
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: observiq-gateway
+spec:
+  maxReplicas: 10
+  minReplicas: 1
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: observiq-gateway
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 60

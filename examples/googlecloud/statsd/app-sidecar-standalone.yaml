@@ -1,0 +1,127 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: statsd-sidecar-standalone
+data:
+  config.yaml: |
+    receivers:
+      statsd:
+        endpoint: 127.0.0.1:8125
+        aggregation_interval: 60s
+
+    processors:
+      resource:
+        attributes:
+        - key: k8s.namespace.name
+          value: "${OTEL_RESOURCE_ATTRIBUTES_NAMESPACE}"
+          action: upsert
+        - key: k8s.pod.name
+          value: "${OTEL_RESOURCE_ATTRIBUTES_POD_NAME}"
+          action: upsert
+        - key: k8s.cluster.name
+          value: "${OTEL_RESOURCE_ATTRIBUTES_CLUSTER_NAME}"
+          action: upsert
+        - key: cloud.region
+          value: us-east1
+          action: insert
+        - key: cloud.availability_zone
+          value: us-east1-b
+          action: insert
+        - key: cloud.platform
+          value: gcp_kubernetes_engine
+          action: insert
+
+      resourcedetection:
+        detectors: [gke]
+        timeout: 2s
+        override: true
+
+    exporters:
+      googlecloud:
+      logging:
+
+    service:
+      pipelines:
+        metrics:
+          receivers:
+            - statsd
+          processors:
+            - resource
+            - resourcedetection
+          exporters:
+            - googlecloud
+            - logging
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: statsd-sidecar-standalone
+spec:
+  selector:
+    matchLabels:
+      app: statsd-sidecar-standalone
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: statsd-sidecar-standalone
+    spec:
+      containers:
+        - name: statsd-sidecar-standalone
+          image: ghcr.io/jsirianni/go-statsd-example:0.0.5
+          imagePullPolicy: Always
+          resources:
+            limits:
+              memory: "50Mi"
+              cpu: 50m
+            requests:
+              memory: "50Mi"
+          env:
+            - name: STATSD_APP_NAME
+              value: frontend
+            - name: STATSD_HOST
+              value: localhost
+            - name: OTEL_INCLUDE_RESOURCES
+              value: "false"
+        - name: otc-container
+          image: observiq/observiq-otel-collector:1.11.1
+          env:
+            - name: OTEL_RESOURCE_ATTRIBUTES_CLUSTER_NAME
+              value: minikube
+            - name: OTEL_RESOURCE_ATTRIBUTES_POD_NAME
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.name
+            - name: OTEL_RESOURCE_ATTRIBUTES_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.namespace
+            - name: GOOGLE_APPLICATION_CREDENTIALS
+              value: /otel/credentials.json
+          resources:
+            requests:
+              cpu: 50m
+              memory: 50Mi
+            limits:
+              memory: 50Mi
+          volumeMounts:
+            - mountPath: /etc/otel/config.yaml
+              subPath: config.yaml
+              name: statsd-sidecar-standalone
+            - mountPath: /otel/credentials.json
+              name: gcp-credentials
+              subPath: credentials.json
+      volumes:
+        - name: statsd-sidecar-standalone
+          configMap:
+            name: statsd-sidecar-standalone
+            items:
+              - key: config.yaml
+                path: config.yaml
+        - name: gcp-credentials
+          secret:
+            defaultMode: 420
+            secretName: gcp-credentials
