@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: statsd-remote-ds
+spec:
+  selector:
+    matchLabels:
+      app: statsd-remote-ds
+  template:
+    metadata:
+      labels:
+        app: statsd-remote-ds
+    spec:
+      containers:
+        - name: statsd
+          image: ghcr.io/jsirianni/go-statsd-example:0.0.5
+          imagePullPolicy: Always
+          resources:
+            limits:
+              memory: "50Mi"
+              cpu: 50m
+            requests:
+              memory: "50Mi"
+          env:
+            - name: STATSD_APP_NAME
+              value: api
+            # Forward statsd metrics to the daemonset agent
+            # running on the same node as this pod.
+            - name: STATSD_HOST
+              valueFrom:
+                  fieldRef:
+                      fieldPath: status.hostIP
+            - name: OTEL_INCLUDE_RESOURCES
+              value: "true"
+            - name: OTEL_RESOURCE_ATTRIBUTES_POD_NAME
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.name
+            - name: OTEL_RESOURCE_ATTRIBUTES_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.namespace
